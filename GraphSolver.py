@@ -3,6 +3,8 @@ import random
 
 from matplotlib import pyplot as plt
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister, Aer, execute, transpile
+from qiskit_aer.noise import NoiseModel
+from qiskit.test.mock import FakeVigo
 from qiskit.circuit.library import MCMT
 from qiskit.extensions import UnitaryGate
 import numpy as np
@@ -13,6 +15,12 @@ import itertools
 import sympy as sp
 from utils import *
 import time
+from qiskit_ionq import IonQProvider
+from IonQAPIservice import IonQAPIservice
+
+ionq_token = "tan6Mb4Qg7BOWwVPLC4XH6XKHjvOHroN"
+provider = IonQProvider(ionq_token)
+service = IonQAPIservice(ionq_token)
 
 class Node:
     def __init__(self, name: Any, colors: Collection[Any]):
@@ -34,39 +42,23 @@ class Node:
         qc = QuantumCircuit(self.qubits)
         i = 1
         while self.n % 2 ** i == 0:
-            qc.h(i - 1)
+            qc.ry(math.pi/2, i - 1)
             i += 1
-        c = [self.j - 1]
+        c = []
         for x in range(self.j - 1, i - 2, -1):
             if in_binary(self.n - 1, x):
-                qc.s(x)
-                qc.h(x)
-                if c[-1] == x:
-                    qc.rz(angle(self.n % 2 ** x, self.n), x)
-                    qc.x(x)
-                    qc.rz(-angle(self.n % 2 ** x, self.n), x)
+                if self.j - 1 == x:
+                    qc.ry(angle(self.n % 2 ** x, self.n), x)
                 else:
-                    qc.rz(angle(self.n % 2 ** x, self.n % 2 ** c[-1]), x)
-                    qc.cx(c[-1], x)
-                    qc.rz(-angle(self.n % 2 ** x, self.n % 2 ** c[-1]), x)
-                qc.h(x)
-                qc.sdg(x)
-                if c[-1] != x:
-                    c.append(x)
-        c.append(i - 1)
+                    qc.cry(angle(self.n % 2 ** x, self.n % 2 ** c[-1]), c[-1], x)
+                c.append(x)
+        qc.x(c[-1])
         for x in range(i - 1, self.j - 1):
             if x == c[-1]:
-                if x != i - 1:
-                    qc.x(c[-1])
+                qc.x(c[-1])
                 del c[-1]
                 qc.x(c[-1])
-            qc.s(x)
-            qc.h(x)
-            qc.t(x)
-            qc.cx(c[-1], x)
-            qc.tdg(x)
-            qc.h(x)
-            qc.sdg(x)
+            qc.cry(math.pi/2, c[-1], x)
         if i - 1 != self.j:
             qc.x(-1)
         return qc
@@ -209,12 +201,13 @@ class GraphSolver:
                 return False
         return True
 
-    def run(self, simulate: bool = True) -> Tuple[Dict[Any, Any], QuantumCircuit, int, int]:
+    def run(self, simulate: bool = True, noise: bool = False) -> Tuple[Dict[Any, Any], QuantumCircuit, int, int]:
         count = 1
         now1 = time.time()
         while True:
             if simulate:
-                backend = Aer.get_backend('aer_simulator')
+                backend = provider.get_backend('ionq_simulator')
+                noise_model = 'aria-1' if noise else None
             else:
                 raise Exception("Not Implemented")
             now = time.time()
@@ -222,21 +215,43 @@ class GraphSolver:
             qc = self._solve(j)
             print(f"Solve {j}:", time.time() - now)
             now = time.time()
-            results = execute(qc, backend=backend, shots=2).result()
+            jobid = service.submit_job(qc, backend=backend, noise_model=noise_model, shots=2)
+            results = service.retrieve_job(jobid, wait_minutes=.5)['results']
             print(f"Execute:", time.time() - now)
-            for result in results.get_counts().keys():
-                colors = {node: int(color, 2) for node, color in zip(self.nodes, result.split(' '))}
+            for result in results['counts'].keys():
+                bits = len(result) // len(self.nodes)
+                colors = {node: int(color[::-1], 2) for node, color in zip(self.nodes, (result.split(' ') if ' ' in result else (lambda gen: [itertools.islice(gen, node.j) for node in self.nodes])(x for x in result)))}
                 if self.check(colors):
                     print("Done:", time.time() - now1)
                     return {color.name: color.num_color[num] for color, num in colors.items()}, qc, j, count
                 count += j
+
+    def run_dist(self, j: int, simulate: bool = True, noise: bool = False, shots: int = 100):
+        if simulate:
+            backend = provider.get_backend('ionq_simulator')
+            noise_model = 'aria-1' if noise else None
+        else:
+            raise Exception("Not Implemented")
+        qc = self._solve(j)
+        jobid = service.submit_job(qc, backend=backend, noise_model=noise_model, shots=shots)
+        results = service.retrieve_job(jobid, wait_minutes=1)['results']
+        colorings = [({node: int(color, 2) for node, color in zip(self.nodes, key.split(' '))}, freq / shots) for key, freq
+                     in results['counts'].items()]
+        colors, freqs = list(zip(*sorted(colorings, key=lambda x: x[1])))
+        corrects = [self.check(color) for color in colors]
+        accuracy = 100 * sum(np.where(corrects, freqs, 0))
+        labels = [[node.num_color[num] if num in node.num_color else 'X' for node, num in color.items()] for color in colors]
+        plt.barh([str(label) for label in labels], freqs, color=['red' if correct else 'blue' for correct in corrects])
+        plt.xlabel('Frequency')
+        plt.ylabel('Coloring')
+        plt.title(f"{accuracy:.2f}% correct")
 
     def reset(self):
         self.m = 1
         self.prev_j = set()
 
 
-def run_experiment(nodes: Collection[Node], edges: Collection[Edge], K: int = 100) -> Tuple[List[int], List[int]]:
+def run_experiment(nodes: Collection[Node], edges: Collection[Edge], K: int = 100, noise: bool = False) -> Tuple[List[int], List[int]]:
     counts = ([], [])
     graph1 = GraphSolver(nodes, edges, False)
     graph2 = GraphSolver(nodes, edges, True)
@@ -245,14 +260,14 @@ def run_experiment(nodes: Collection[Node], edges: Collection[Edge], K: int = 10
             print(" ", k)
         graph1.reset()
         graph2.reset()
-        colors1, qc1, j1, count1 = graph1.run()
+        colors1, qc1, j1, count1 = graph1.run(noise=noise)
         counts[0].append(count1)
-        colors2, qc2, j2, count2 = graph2.run()
+        colors2, qc2, j2, count2 = graph2.run(noise=noise)
         counts[1].append(count2)
     return counts
 
 
-def run_experiments(node_range: Iterable[int], color_range: Iterable[int], K: int = 10):
+def run_experiments(node_range: Iterable[int], color_range: Iterable[int], K: int = 10, noise: bool = False):
     means = {}
     for color_num in color_range:
         print(color_num)
@@ -263,13 +278,13 @@ def run_experiments(node_range: Iterable[int], color_range: Iterable[int], K: in
             print('', node_num)
             nodes = [Node(i, colors) for i in range(node_num)]
             edges = [Edge(nodes[i], nodes[i+1]) for i in range(node_num - 1)]
-            count1, count2 = run_experiment(nodes, edges, K)
+            count1, count2 = run_experiment(nodes, edges, K, noise)
             y1.append(sum(count1) / K)
             y2.append(sum(count2) / K)
             means[f"{color_num}-{node_num}"] = (count1, count2)
         plt.figure()
-        plt.plot(node_range, y1, '-o', label='Without')
-        plt.plot(node_range, y2, '-o', label='With')
+        plt.plot(node_range, y1, '-o', label='Original')
+        plt.plot(node_range, y2, '-o', label='Modified')
         plt.legend()
         plt.title(f"Average Grover Repetitions for {color_num} Colors ({K} Simulations)")
         plt.xlabel('Nodes')
